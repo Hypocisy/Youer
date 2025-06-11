@@ -104,29 +104,40 @@ public class YouerModuleManager {
     }
 
     private static void addExtra(List<String> extras, MethodHandle implAddExtraMH, MethodHandle implAddExtraToAllUnnamedMH) {
-        extras.forEach(extra -> {
-            ParserData data = parseModuleExtra(extra);
-            if (data != null) {
-                ModuleLayer.boot().findModule(data.module).ifPresent(m -> {
-                    try {
-                        if ("ALL-UNNAMED".equals(data.target)) {
-                            implAddExtraToAllUnnamedMH.invokeWithArguments(m, data.packages);
-                        } else {
-                            ModuleLayer.boot().findModule(data.target).ifPresent(tm -> {
-                                try {
-                                    implAddExtraMH.invokeWithArguments(m, data.packages, tm);
-                                } catch (Throwable t) {
-                                    throw new RuntimeException(t);
-                                }
-                            });
+    extras.forEach(extra -> {
+        ParserData data = parseModuleExtra(extra);
+        if (data != null) {
+            ModuleLayer.boot().findModule(data.module).ifPresent(m -> {
+                try {
+                    if ("ALL-UNNAMED".equals(data.target)) {
+                        for (String pkg : data.packages) {
+                            // 如果已经向 ALL-UNNAMED 导出过就跳过
+                            if (!m.isExported(pkg)) {
+                                implAddExtraToAllUnnamedMH.invokeWithArguments(m, List.of(pkg));
+                            }
                         }
-                    } catch (Throwable t) {
-                        throw new RuntimeException(t);
+                    } else {
+                        ModuleLayer.boot().findModule(data.target).ifPresent(tm -> {
+                            for (String pkg : data.packages) {
+                                // 如果已经向目标模块导出过就跳过
+                                if (!m.isExported(pkg, tm)) {
+                                    try {
+                                        implAddExtraMH.invokeWithArguments(m, List.of(pkg), tm);
+                                    } catch (Throwable t) {
+                                        throw new RuntimeException("Failed to export package " + pkg + " from " + m.getName() + " to " + tm.getName(), t);
+                                    }
+                                }
+                            }
+                        });
                     }
-                });
-            }
-        });
+                } catch (Throwable t) {
+                    throw new RuntimeException("Failed to process export for: " + data, t);
+                }
+            });
+        }
+    });
     }
+
 
     @SneakyThrows
     public static void applyLaunchArgs(List<String> args) {
