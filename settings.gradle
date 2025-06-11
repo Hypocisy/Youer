@@ -55,3 +55,4 @@ project(":coremods").name = "neoforge-coremods"
 gradle.settingsEvaluated {
     gradle.extensions.add("repositoryBaseUrls", dependencyResolutionManagement.repositories.findAll { it instanceof MavenArtifactRepository }.collect { it.url }.toArray(URI[]::new))
 }
+// for active git actions
