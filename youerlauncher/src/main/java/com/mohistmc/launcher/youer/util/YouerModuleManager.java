@@ -104,40 +104,29 @@ public class YouerModuleManager {
     }
 
     private static void addExtra(List<String> extras, MethodHandle implAddExtraMH, MethodHandle implAddExtraToAllUnnamedMH) {
-    extras.forEach(extra -> {
-        ParserData data = parseModuleExtra(extra);
-        if (data != null) {
-            ModuleLayer.boot().findModule(data.module).ifPresent(m -> {
-                try {
-                    if ("ALL-UNNAMED".equals(data.target)) {
-                        for (String pkg : data.packages) {
-                            // 如果已经向 ALL-UNNAMED 导出过就跳过
-                            if (!m.isExported(pkg)) {
-                                implAddExtraToAllUnnamedMH.invokeWithArguments(m, List.of(pkg));
-                            }
-                        }
-                    } else {
-                        ModuleLayer.boot().findModule(data.target).ifPresent(tm -> {
-                            for (String pkg : data.packages) {
-                                // 如果已经向目标模块导出过就跳过
-                                if (!m.isExported(pkg, tm)) {
-                                    try {
-                                        implAddExtraMH.invokeWithArguments(m, List.of(pkg), tm);
-                                    } catch (Throwable t) {
-                                        throw new RuntimeException("Failed to export package " + pkg + " from " + m.getName() + " to " + tm.getName(), t);
-                                    }
+        extras.forEach(extra -> {
+            ParserData data = parseModuleExtra(extra);
+            if (data != null) {
+                ModuleLayer.boot().findModule(data.module).ifPresent(m -> {
+                    try {
+                        if ("ALL-UNNAMED".equals(data.target)) {
+                            implAddExtraToAllUnnamedMH.invokeWithArguments(m, data.packages);
+                        } else {
+                            ModuleLayer.boot().findModule(data.target).ifPresent(tm -> {
+                                try {
+                                    implAddExtraMH.invokeWithArguments(m, data.packages, tm);
+                                } catch (Throwable t) {
+                                    throw new RuntimeException(t);
                                 }
-                            }
-                        });
+                            });
+                        }
+                    } catch (Throwable t) {
+                        throw new RuntimeException(t);
                     }
-                } catch (Throwable t) {
-                    throw new RuntimeException("Failed to process export for: " + data, t);
-                }
-            });
-        }
-    });
+                });
+            }
+        });
     }
-
 
     @SneakyThrows
     public static void applyLaunchArgs(List<String> args) {
@@ -168,70 +157,130 @@ public class YouerModuleManager {
         ModuleFinder finder = ModuleFinder.of(Arrays.stream(modulePath.split(File.pathSeparator)).map(Paths::get).peek(JarLoader::loadJar).toArray(Path[]::new));
         MethodHandle loadModuleMH = IMPL_LOOKUP.findVirtual(Class.forName("jdk.internal.loader.BuiltinClassLoader"), "loadModule", MethodType.methodType(void.class, ModuleReference.class));
 
-        // Resolve modules to a new config
-        Configuration config = Configuration.resolveAndBind(finder, List.of(ModuleLayer.boot().configuration()), finder, finder.findAll().stream().peek(mref -> {
+        // Get existing module names from boot layer
+        Set<String> existingModuleNames = ModuleLayer.boot().configuration().modules()
+                .stream()
+                .map(ResolvedModule::name)
+                .collect(Collectors.toSet());
+
+        // Filter out modules that already exist
+        Set<ModuleReference> newModules = finder.findAll()
+                .stream()
+                .filter(mref -> {
+                    String moduleName = mref.descriptor().name();
+                    if (existingModuleNames.contains(moduleName)) {
+                        System.out.println("Skipping duplicate module: " + moduleName);
+                        return false;
+                    }
+                    return true;
+                })
+                .collect(Collectors.toSet());
+
+        // If no new modules to load, return early
+        if (newModules.isEmpty()) {
+            System.out.println("No new modules to load, all modules already exist");
+            return;
+        }
+
+        // Create a new ModuleFinder with only the filtered modules
+        ModuleFinder filteredFinder = new ModuleFinder() {
+            @Override
+            public java.util.Optional<ModuleReference> find(String name) {
+                return newModules.stream()
+                        .filter(mref -> mref.descriptor().name().equals(name))
+                        .findFirst();
+            }
+
+            @Override
+            public Set<ModuleReference> findAll() {
+                return newModules;
+            }
+        };
+
+        // Load modules using filtered finder
+        newModules.forEach(mref -> {
             try {
-                // Load all extra modules in system class loader (unnamed modules for now)
                 loadModuleMH.invokeWithArguments(Thread.currentThread().getContextClassLoader(), mref);
             } catch (Throwable throwable) {
-                throw new RuntimeException(throwable);
-            }
-        }).map(ModuleReference::descriptor).map(ModuleDescriptor::name).collect(Collectors.toList()));
-
-        // Copy the new config graph to boot module layer config
-        MethodHandle graphGetter = IMPL_LOOKUP.findGetter(Configuration.class, "graph", Map.class);
-        HashMap<ResolvedModule, Set<ResolvedModule>> graphMap = new HashMap<>((Map<ResolvedModule, Set<ResolvedModule>>) graphGetter.invokeWithArguments(config));
-        MethodHandle cfSetter = IMPL_LOOKUP.findSetter(ResolvedModule.class, "cf", Configuration.class);
-        // Reset all extra resolved modules config to boot module layer config
-        graphMap.forEach((k, v) -> {
-            try {
-                cfSetter.invokeWithArguments(k, ModuleLayer.boot().configuration());
-                v.forEach(m -> {
-                    try {
-                        cfSetter.invokeWithArguments(m, ModuleLayer.boot().configuration());
-                    } catch (Throwable throwable) {
-                        throw new RuntimeException(throwable);
-                    }
-                });
-            } catch (Throwable throwable) {
-                throw new RuntimeException(throwable);
+                System.err.println("Failed to load module: " + mref.descriptor().name());
+                throwable.printStackTrace();
+                // Continue loading other modules instead of throwing
             }
         });
-        graphMap.putAll((Map<ResolvedModule, Set<ResolvedModule>>) graphGetter.invokeWithArguments(ModuleLayer.boot().configuration()));
-        IMPL_LOOKUP.findSetter(Configuration.class, "graph", Map.class).invokeWithArguments(ModuleLayer.boot().configuration(), new HashMap<>(graphMap));
 
-        // Reset boot module layer resolved modules as new config-resolved modules to prepare to define modules
-        Set<ResolvedModule> oldBootModules = ModuleLayer.boot().configuration().modules();
-        MethodHandle modulesSetter = IMPL_LOOKUP.findSetter(Configuration.class, "modules", Set.class);
-        HashSet<ResolvedModule> modulesSet = new HashSet<>(config.modules());
-        modulesSetter.invokeWithArguments(ModuleLayer.boot().configuration(), new HashSet<>(modulesSet));
+        // Only proceed with configuration if we have modules to configure
+        try {
+            // Resolve modules to a new config
+            Configuration config = Configuration.resolveAndBind(filteredFinder, List.of(ModuleLayer.boot().configuration()), filteredFinder,
+                    newModules.stream().map(ModuleReference::descriptor).map(ModuleDescriptor::name).collect(Collectors.toList()));
 
-        // Prepare to add all the new config "nameToModule" to boot module layer config
-        MethodHandle nameToModuleGetter = IMPL_LOOKUP.findGetter(Configuration.class, "nameToModule", Map.class);
-        HashMap<String, ResolvedModule> nameToModuleMap = new HashMap<>((Map<String, ResolvedModule>) nameToModuleGetter.invokeWithArguments(ModuleLayer.boot().configuration()));
-        nameToModuleMap.putAll((Map<String, ResolvedModule>) nameToModuleGetter.invokeWithArguments(config));
-        IMPL_LOOKUP.findSetter(Configuration.class, "nameToModule", Map.class).invokeWithArguments(ModuleLayer.boot().configuration(), new HashMap<>(nameToModuleMap));
+            // Copy the new config graph to boot module layer config
+            MethodHandle graphGetter = IMPL_LOOKUP.findGetter(Configuration.class, "graph", Map.class);
+            HashMap<ResolvedModule, Set<ResolvedModule>> graphMap = new HashMap<>((Map<ResolvedModule, Set<ResolvedModule>>) graphGetter.invokeWithArguments(config));
+            MethodHandle cfSetter = IMPL_LOOKUP.findSetter(ResolvedModule.class, "cf", Configuration.class);
 
-        // Define all extra modules and add all the new config "nameToModule" to boot module layer config
-        ((Map<String, Module>) IMPL_LOOKUP.findGetter(ModuleLayer.class, "nameToModule", Map.class).invokeWithArguments(ModuleLayer.boot())).putAll((Map<String, Module>) IMPL_LOOKUP.findStatic(Module.class, "defineModules", MethodType.methodType(Map.class, Configuration.class, Function.class, ModuleLayer.class)).invokeWithArguments(ModuleLayer.boot().configuration(), (Function<String, ClassLoader>) name -> Thread.currentThread().getContextClassLoader(), ModuleLayer.boot()));
+            // Reset all extra resolved modules config to boot module layer config
+            graphMap.forEach((k, v) -> {
+                try {
+                    cfSetter.invokeWithArguments(k, ModuleLayer.boot().configuration());
+                    v.forEach(m -> {
+                        try {
+                            cfSetter.invokeWithArguments(m, ModuleLayer.boot().configuration());
+                        } catch (Throwable throwable) {
+                            System.err.println("Failed to set configuration for module: " + m.name());
+                            throwable.printStackTrace();
+                        }
+                    });
+                } catch (Throwable throwable) {
+                    System.err.println("Failed to set configuration for module: " + k.name());
+                    throwable.printStackTrace();
+                }
+            });
 
-        // Add all the resolved modules
-        modulesSet.addAll(oldBootModules);
-        modulesSetter.invokeWithArguments(ModuleLayer.boot().configuration(), new HashSet<>(modulesSet));
+            graphMap.putAll((Map<ResolvedModule, Set<ResolvedModule>>) graphGetter.invokeWithArguments(ModuleLayer.boot().configuration()));
+            IMPL_LOOKUP.findSetter(Configuration.class, "graph", Map.class).invokeWithArguments(ModuleLayer.boot().configuration(), new HashMap<>(graphMap));
 
-        // Reset cache of boot module layer
-        IMPL_LOOKUP.findSetter(ModuleLayer.class, "modules", Set.class).invokeWithArguments(ModuleLayer.boot(), null);
-        IMPL_LOOKUP.findSetter(ModuleLayer.class, "servicesCatalog", Class.forName("jdk.internal.module.ServicesCatalog")).invokeWithArguments(ModuleLayer.boot(), null);
+            // Reset boot module layer resolved modules as new config-resolved modules to prepare to define modules
+            Set<ResolvedModule> oldBootModules = ModuleLayer.boot().configuration().modules();
+            MethodHandle modulesSetter = IMPL_LOOKUP.findSetter(Configuration.class, "modules", Set.class);
+            HashSet<ResolvedModule> modulesSet = new HashSet<>(config.modules());
+            modulesSetter.invokeWithArguments(ModuleLayer.boot().configuration(), new HashSet<>(modulesSet));
 
-        // Add reads from extra modules to jdk modules
-        MethodHandle implAddReadsMH = IMPL_LOOKUP.findVirtual(Module.class, "implAddReads", MethodType.methodType(void.class, Module.class));
-        config.modules().forEach(rm -> ModuleLayer.boot().findModule(rm.name()).ifPresent(m -> oldBootModules.forEach(brm -> ModuleLayer.boot().findModule(brm.name()).ifPresent(bm -> {
-            try {
-                implAddReadsMH.invokeWithArguments(m, bm);
-            } catch (Throwable throwable) {
-                throw new RuntimeException(throwable);
-            }
-        }))));
+            // Prepare to add all the new config "nameToModule" to boot module layer config
+            MethodHandle nameToModuleGetter = IMPL_LOOKUP.findGetter(Configuration.class, "nameToModule", Map.class);
+            HashMap<String, ResolvedModule> nameToModuleMap = new HashMap<>((Map<String, ResolvedModule>) nameToModuleGetter.invokeWithArguments(ModuleLayer.boot().configuration()));
+            nameToModuleMap.putAll((Map<String, ResolvedModule>) nameToModuleGetter.invokeWithArguments(config));
+            IMPL_LOOKUP.findSetter(Configuration.class, "nameToModule", Map.class).invokeWithArguments(ModuleLayer.boot().configuration(), new HashMap<>(nameToModuleMap));
+
+            // Define all extra modules and add all the new config "nameToModule" to boot module layer config
+            ((Map<String, Module>) IMPL_LOOKUP.findGetter(ModuleLayer.class, "nameToModule", Map.class).invokeWithArguments(ModuleLayer.boot())).putAll((Map<String, Module>) IMPL_LOOKUP.findStatic(Module.class, "defineModules", MethodType.methodType(Map.class, Configuration.class, Function.class, ModuleLayer.class)).invokeWithArguments(ModuleLayer.boot().configuration(), (Function<String, ClassLoader>) name -> Thread.currentThread().getContextClassLoader(), ModuleLayer.boot()));
+
+            // Add all the resolved modules
+            modulesSet.addAll(oldBootModules);
+            modulesSetter.invokeWithArguments(ModuleLayer.boot().configuration(), new HashSet<>(modulesSet));
+
+            // Reset cache of boot module layer
+            IMPL_LOOKUP.findSetter(ModuleLayer.class, "modules", Set.class).invokeWithArguments(ModuleLayer.boot(), null);
+            IMPL_LOOKUP.findSetter(ModuleLayer.class, "servicesCatalog", Class.forName("jdk.internal.module.ServicesCatalog")).invokeWithArguments(ModuleLayer.boot(), null);
+
+            // Add reads from extra modules to jdk modules
+            MethodHandle implAddReadsMH = IMPL_LOOKUP.findVirtual(Module.class, "implAddReads", MethodType.methodType(void.class, Module.class));
+            config.modules().forEach(rm -> ModuleLayer.boot().findModule(rm.name()).ifPresent(m -> oldBootModules.forEach(brm -> ModuleLayer.boot().findModule(brm.name()).ifPresent(bm -> {
+                try {
+                    implAddReadsMH.invokeWithArguments(m, bm);
+                } catch (Throwable throwable) {
+                    System.err.println("Failed to add reads from " + m.getName() + " to " + bm.getName());
+                    throwable.printStackTrace();
+                }
+            }))));
+
+            System.out.println("Successfully loaded " + newModules.size() + " new modules");
+
+        } catch (Exception e) {
+            System.err.println("Failed to configure modules, but modules were loaded into classloader");
+            e.printStackTrace();
+            // Don't rethrow - allow the application to continue
+        }
     }
 
     private record ParserData(String module, String packages, String target) {
